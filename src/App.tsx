@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -10,9 +10,34 @@ import {
   FlatList,
   StyleSheet,
   Alert,
+  ActivityIndicator,
 } from 'react-native';
+import type { TextInputProps, StyleProp, ViewStyle } from 'react-native';
+
 import { supabase } from './supabaseClient';
-import { statusDe, STATUS_LABEL, STATUS_COLOR } from './utils/status';
+import { statusDe, STATUS_LABEL, STATUS_COLOR } from './status';
+
+// Interfaces de Tipo
+export interface Norma {
+  id?: string | number;
+  codigo: string;
+  titulo: string;
+  revisao: string;
+  data_aquisicao: string;
+  carimbo_copia_controlada: boolean;
+  estado_fisico: string;
+  local_arquivo: string;
+  ultima_verificacao: string;
+  verificado_por: string;
+  observacoes: string;
+  criado_em?: string;
+  atualizado_em?: string;
+}
+
+interface CampoProps extends TextInputProps {
+  label: string;
+  style?: StyleProp<ViewStyle>;
+}
 
 const FILTROS = [
   ['todos', 'Todas'],
@@ -20,9 +45,9 @@ const FILTROS = [
   ['sem_carimbo', 'Sem carimbo'],
   ['rasurada', 'Rasuradas'],
   ['ok', 'Em conformidade'],
-];
+] as const;
 
-const VAZIA = {
+const VAZIA: Norma = {
   codigo: '',
   titulo: '',
   revisao: '',
@@ -36,15 +61,25 @@ const VAZIA = {
 };
 
 export default function App() {
-  const [normas, setNormas] = useState([]);
-  const [filtro, setFiltro] = useState('todos');
+  const [normas, setNormas] = useState<Norma[]>([]);
+  const [filtro, setFiltro] = useState<string>('todos');
   const [modalAberto, setModalAberto] = useState(false);
-  const [editando, setEditando] = useState(null);
-  const [form, setForm] = useState(VAZIA);
+  const [editando, setEditando] = useState<string | number | null>(null);
+  const [form, setForm] = useState<Norma>(VAZIA);
+  const [carregando, setCarregando] = useState(false);
+  const [salvando, setSalvando] = useState(false);
 
   const carregar = useCallback(async () => {
-    const { data, error } = await supabase.from('normas').select('*').order('codigo');
-    if (!error) setNormas(data || []);
+    setCarregando(true);
+    try {
+      const { data, error } = await supabase.from('normas').select('*').order('codigo');
+      if (error) throw error;
+      setNormas(data || []);
+    } catch (err: any) {
+      Alert.alert('Erro ao carregar', err.message || 'Não foi possível buscar as normas.');
+    } finally {
+      setCarregando(false);
+    }
   }, []);
 
   useEffect(() => {
@@ -53,26 +88,33 @@ export default function App() {
       .channel('normas-changes')
       .on('postgres_changes', { event: '*', schema: 'public', table: 'normas' }, carregar)
       .subscribe();
+
     return () => {
       supabase.removeChannel(canal);
     };
   }, [carregar]);
 
-  const contagens = normas.reduce((acc, n) => {
-    const s = statusDe(n);
-    acc[s] = (acc[s] || 0) + 1;
-    acc.todos = (acc.todos || 0) + 1;
-    return acc;
-  }, {});
+  const contagens = useMemo(() => {
+    return normas.reduce<Record<string, number>>((acc, n) => {
+      const s = statusDe(n);
+      acc[s] = (acc[s] || 0) + 1;
+      acc.todos = (acc.todos || 0) + 1;
+      return acc;
+    }, {});
+  }, [normas]);
 
-  const listaFiltrada = normas.filter((n) => filtro === 'todos' || statusDe(n) === filtro);
+  const listaFiltrada = useMemo(() => {
+    return normas.filter((n) => filtro === 'todos' || statusDe(n) === filtro);
+  }, [normas, filtro]);
 
   function abrirNova() {
     setEditando(null);
     setForm(VAZIA);
     setModalAberto(true);
   }
-  function abrirEdicao(n) {
+
+  function abrirEdicao(n: Norma) {
+    if (!n.id) return;
     setEditando(n.id);
     setForm({ ...VAZIA, ...n });
     setModalAberto(true);
@@ -80,24 +122,49 @@ export default function App() {
 
   async function salvar() {
     if (!form.codigo.trim()) {
-      Alert.alert('Informe o código da norma');
+      Alert.alert('Atenção', 'Informe o código da norma.');
       return;
     }
-    const payload = { ...form, atualizado_em: new Date().toISOString() };
-    if (editando) {
-      await supabase.from('normas').update(payload).eq('id', editando);
-    } else {
-      await supabase.from('normas').insert({ ...payload, criado_em: new Date().toISOString() });
+
+    setSalvando(true);
+    try {
+      const payload = { ...form, atualizado_em: new Date().toISOString() };
+      if (editando) {
+        const { error } = await supabase.from('normas').update(payload).eq('id', editando);
+        if (error) throw error;
+      } else {
+        const { error } = await supabase.from('normas').insert({ ...payload, criado_em: new Date().toISOString() });
+        if (error) throw error;
+      }
+      setModalAberto(false);
+      carregar();
+    } catch (err: any) {
+      Alert.alert('Erro ao salvar', err.message || 'Ocorreu um erro ao gravar a norma.');
+    } finally {
+      setSalvando(false);
     }
-    setModalAberto(false);
-    carregar();
   }
 
   async function excluir() {
     if (!editando) return;
-    await supabase.from('normas').delete().eq('id', editando);
-    setModalAberto(false);
-    carregar();
+
+    Alert.alert('Confirmar exclusão', 'Tem certeza que deseja remover esta norma?', [
+      { text: 'Cancelar', style: 'cancel' },
+      {
+        text: 'Excluir',
+        style: 'destructive',
+        onPress: async () => {
+          try {
+            const { error } = await supabase.from('normas').delete().eq('id', editando);
+            if (error) throw error;
+            setModalAberto(false);
+            carregar();
+          } catch (err: any) {
+            Alert.alert('Erro ao excluir', err.message || 'Não foi possível excluir a norma.');
+          }
+        },
+      },
+    ]);
   }
 
   return (
@@ -126,32 +193,36 @@ export default function App() {
         </Pressable>
       </View>
 
-      <FlatList
-        data={listaFiltrada}
-        keyExtractor={(item) => String(item.id)}
-        contentContainerStyle={{ paddingBottom: 40 }}
-        ListEmptyComponent={<Text style={styles.vazio}>Nenhuma norma nesse filtro.</Text>}
-        renderItem={({ item }) => {
-          const s = statusDe(item);
-          return (
-            <Pressable style={styles.card} onPress={() => abrirEdicao(item)}>
-              <View style={{ flex: 1 }}>
-                <Text style={styles.cardTitulo}>
-                  {item.codigo} — {item.titulo}
-                </Text>
-                <Text style={styles.cardSub}>
-                  Revisão {item.revisao || '—'} · {item.local_arquivo || 'local não informado'}
-                </Text>
-              </View>
-              <View style={[styles.badge, { backgroundColor: STATUS_COLOR[s] + '22' }]}>
-                <Text style={[styles.badgeTxt, { color: STATUS_COLOR[s] }]}>
-                  {STATUS_LABEL[s]}
-                </Text>
-              </View>
-            </Pressable>
-          );
-        }}
-      />
+      {carregando && normas.length === 0 ? (
+        <ActivityIndicator size="large" color="#2F4B3F" style={{ marginTop: 40 }} />
+      ) : (
+        <FlatList
+          data={listaFiltrada}
+          keyExtractor={(item) => String(item.id)}
+          contentContainerStyle={{ paddingBottom: 40 }}
+          ListEmptyComponent={<Text style={styles.vazio}>Nenhuma norma nesse filtro.</Text>}
+          renderItem={({ item }) => {
+            const s = statusDe(item);
+            return (
+              <Pressable style={styles.card} onPress={() => abrirEdicao(item)}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.cardTitulo}>
+                    {item.codigo} — {item.titulo}
+                  </Text>
+                  <Text style={styles.cardSub}>
+                    Revisão {item.revisao || '—'} · {item.local_arquivo || 'local não informado'}
+                  </Text>
+                </View>
+                <View style={[styles.badge, { backgroundColor: (STATUS_COLOR[s] || '#888') + '22' }]}>
+                  <Text style={[styles.badgeTxt, { color: STATUS_COLOR[s] || '#333' }]}>
+                    {STATUS_LABEL[s] || s}
+                  </Text>
+                </View>
+              </Pressable>
+            );
+          }}
+        />
+      )}
 
       <Modal
         visible={modalAberto}
@@ -166,26 +237,26 @@ export default function App() {
             <Campo
               label="Código da norma"
               value={form.codigo}
-              onChangeText={(v) => setForm({ ...form, codigo: v })}
+              onChangeText={(v) => setForm((f) => ({ ...f, codigo: v }))}
               placeholder="Ex: NBR 6118"
             />
             <Campo
               label="Título"
               value={form.titulo}
-              onChangeText={(v) => setForm({ ...form, titulo: v })}
+              onChangeText={(v) => setForm((f) => ({ ...f, titulo: v }))}
             />
             <View style={styles.linha}>
               <Campo
                 style={{ flex: 1 }}
                 label="Revisão/edição"
                 value={form.revisao}
-                onChangeText={(v) => setForm({ ...form, revisao: v })}
+                onChangeText={(v) => setForm((f) => ({ ...f, revisao: v }))}
               />
               <Campo
                 style={{ flex: 1 }}
                 label="Local onde fica arquivada"
                 value={form.local_arquivo}
-                onChangeText={(v) => setForm({ ...form, local_arquivo: v })}
+                onChangeText={(v) => setForm((f) => ({ ...f, local_arquivo: v }))}
               />
             </View>
             <View style={styles.linha}>
@@ -193,14 +264,14 @@ export default function App() {
                 style={{ flex: 1 }}
                 label="Data de aquisição"
                 value={form.data_aquisicao}
-                onChangeText={(v) => setForm({ ...form, data_aquisicao: v })}
+                onChangeText={(v) => setForm((f) => ({ ...f, data_aquisicao: v }))}
                 placeholder="AAAA-MM-DD"
               />
               <Campo
                 style={{ flex: 1 }}
                 label="Última verificação"
                 value={form.ultima_verificacao}
-                onChangeText={(v) => setForm({ ...form, ultima_verificacao: v })}
+                onChangeText={(v) => setForm((f) => ({ ...f, ultima_verificacao: v }))}
                 placeholder="AAAA-MM-DD"
               />
             </View>
@@ -209,7 +280,7 @@ export default function App() {
               <Text style={styles.label}>Tem carimbo de cópia controlada</Text>
               <Switch
                 value={form.carimbo_copia_controlada}
-                onValueChange={(v) => setForm({ ...form, carimbo_copia_controlada: v })}
+                onValueChange={(v) => setForm((f) => ({ ...f, carimbo_copia_controlada: v }))}
               />
             </View>
 
@@ -218,7 +289,7 @@ export default function App() {
               {['boa', 'rasurada'].map((op) => (
                 <Pressable
                   key={op}
-                  onPress={() => setForm({ ...form, estado_fisico: op })}
+                  onPress={() => setForm((f) => ({ ...f, estado_fisico: op }))}
                   style={[styles.opcaoBtn, form.estado_fisico === op && styles.opcaoBtnAtiva]}
                 >
                   <Text
@@ -233,27 +304,31 @@ export default function App() {
             <Campo
               label="Verificado por"
               value={form.verificado_por}
-              onChangeText={(v) => setForm({ ...form, verificado_por: v })}
+              onChangeText={(v) => setForm((f) => ({ ...f, verificado_por: v }))}
             />
             <Campo
               label="Observações"
               value={form.observacoes}
-              onChangeText={(v) => setForm({ ...form, observacoes: v })}
+              onChangeText={(v) => setForm((f) => ({ ...f, observacoes: v }))}
               multiline
             />
 
             <View style={styles.acoes}>
               {editando && (
-                <Pressable onPress={excluir}>
+                <Pressable onPress={excluir} disabled={salvando}>
                   <Text style={styles.btnExcluir}>Excluir</Text>
                 </Pressable>
               )}
-              <View style={{ flexDirection: 'row', gap: 10, marginLeft: 'auto' }}>
-                <Pressable onPress={() => setModalAberto(false)}>
+              <View style={{ flexDirection: 'row', gap: 10, marginLeft: 'auto', alignItems: 'center' }}>
+                <Pressable onPress={() => setModalAberto(false)} disabled={salvando}>
                   <Text style={styles.btnCancelar}>Cancelar</Text>
                 </Pressable>
-                <Pressable style={styles.btnPrimario} onPress={salvar}>
-                  <Text style={styles.btnPrimarioTxt}>Salvar</Text>
+                <Pressable style={styles.btnPrimario} onPress={salvar} disabled={salvando}>
+                  {salvando ? (
+                    <ActivityIndicator size="small" color="#fff" />
+                  ) : (
+                    <Text style={styles.btnPrimarioTxt}>Salvar</Text>
+                  )}
                 </Pressable>
               </View>
             </View>
@@ -264,7 +339,7 @@ export default function App() {
   );
 }
 
-function Campo({ label, style, multiline, ...props }) {
+function Campo({ label, style, multiline, ...props }: CampoProps) {
   return (
     <View style={[styles.campo, style]}>
       <Text style={styles.label}>{label}</Text>
@@ -278,14 +353,14 @@ function Campo({ label, style, multiline, ...props }) {
 }
 
 const styles = StyleSheet.create({
-  page: { flex: 1, backgroundColor: '#F3F4F1', minHeight: '100vh' },
+  page: { flex: 1, backgroundColor: '#F3F4F1' },
   header: { padding: 24 },
   h1: { fontSize: 22, fontWeight: '700', color: '#1C2321' },
   sub: { fontSize: 14, color: '#5B655F', marginTop: 2 },
   toolbar: {
     flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
+    justify: 'space-between',
     paddingHorizontal: 24,
     marginBottom: 14,
     gap: 10,
@@ -325,10 +400,10 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: 'rgba(20,24,22,0.45)',
     alignItems: 'center',
-    justifyContent: 'flex-start',
-    paddingTop: '5vh',
+    justifyContent: 'center',
+    padding: 16,
   },
-  modal: { backgroundColor: '#fff', borderRadius: 12, width: '92%', maxWidth: 480, maxHeight: '90vh' },
+  modal: { backgroundColor: '#fff', borderRadius: 12, width: '100%', maxWidth: 480, maxHeight: '90%' },
   h2: { fontSize: 18, fontWeight: '700', marginBottom: 16 },
   campo: { marginBottom: 13 },
   label: { fontSize: 12.5, fontWeight: '600', color: '#5B655F', marginBottom: 5 },
@@ -358,8 +433,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 14,
   },
-  opcaoBtnAtiva: { backgroundColor: '#132bb3', borderColor: '#2F4B3F' },
-  opcaoTxt: { fontSize: 13, color: '#3748df' },
+  opcaoBtnAtiva: { backgroundColor: '#2F4B3F', borderColor: '#2F4B3F' },
+  opcaoTxt: { fontSize: 13, color: '#5B655F' },
   opcaoTxtAtiva: { color: '#fff', fontWeight: '600' },
   acoes: { flexDirection: 'row', alignItems: 'center', marginTop: 6 },
   btnExcluir: { color: '#A4302A', fontSize: 14 },
